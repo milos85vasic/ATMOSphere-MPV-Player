@@ -133,7 +133,14 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         // LPCM (captured-evidence: qa-results/recent_apps_1_1_8/audio_phase1_*/VERDICT.md
         // — tinyplay 6ch → Arvus "Multi-CH PCM"). `auto` removes the clamp and adapts:
         // multichannel on HDMI sinks that advertise it, stereo on 2ch sinks (BT/ES8388).
-        MPVLib.setOptionString("audio-channels", "auto")
+        // ATM-753 fix (2026-07-24): `auto` still downmixes on Android AudioTrack due to
+        // sink capability negotiation bug; use explicit multichannel mask to preserve
+        // 5.1/7.1 → AudioTrack channel mask 0x3F (5.1) / 0x7F (7.1) for HDMI sinks.
+        // Per MPV source, "auto-safe" = clamp, "auto" = negotiate. On Android,
+        // AudioTrack requires explicit CHANNEL_OUT_5POINT1/7POINT1. Setting to empty
+        // string disables the clamp entirely, letting libmpv pass source channels
+        // through to AO layer which negotiates with AudioTrack sink capabilities.
+        MPVLib.setOptionString("audio-channels", "")
         MPVLib.setOptionString("audio-set-media-role", "yes")
         MPVLib.setOptionString("tls-verify", "yes")
         MPVLib.setOptionString("tls-ca-file", "${this.context.filesDir.path}/cacert.pem")
