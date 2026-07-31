@@ -5,6 +5,7 @@ import `is`.xyz.mpv.MPVLib.MpvEvent
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.annotation.SuppressLint
+import android.app.ActivityOptions
 import android.app.ForegroundServiceStartNotAllowedException
 import androidx.appcompat.app.AlertDialog
 import android.app.PictureInPictureParams
@@ -252,6 +253,13 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     // the video while the phone/tablet keeps the controls UI.
     private var secondaryPresentation: VideoSecondaryPresentation? = null
 
+    // ATM-961: TRUE when onCreate self-placed this activity onto the secondary
+    // (TV) display and is finishing the primary instance. Nothing was initialized
+    // (binding / player / mediaSession are all uninitialized lateinit/fields), so
+    // onDestroy MUST skip its teardown — touching binding.player would throw
+    // UninitializedPropertyAccessException (§11.4.1 not-error-prone).
+    private var relaunchingToSecondary = false
+
     // §JQ fix (Issues.md): when routing to a secondary Presentation, libmpv's video
     // output surface attaches ASYNCHRONOUSLY (onReady → attachSurface). playFile() must
     // be deferred until that surface is attached, otherwise libmpv loads with no output
@@ -264,6 +272,24 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     override fun onCreate(icicle: Bundle?) {
         super.onCreate(icicle)
+
+        // ATMOSphere ATM-961 (Feature, REQUIRES_REBUILD, 2026-07-29) — self-place
+        // THIS video activity on the secondary (TV) display so MPV's OWN landscape
+        // window + SurfaceView + HW decoder fill 1920x1080 natively (the device-
+        // proven Case-4 native-fill path). MPV's launcher (.MainActivity, a file
+        // picker) != its video activity (.MPVActivity), so the Presenter CANNOT
+        // place the RIGHT activity on the TV via getLaunchIntentForPackage — the app
+        // must self-place its own video activity. Runs BEFORE any view / player /
+        // mediaSession init so the finishing PRIMARY instance never initializes a
+        // decoder it is about to discard. Coordinated with the Presenter
+        // LandscapeRelaunchController via persist.atmosphere.video.relaunch_owns so
+        // exactly ONE entity owns display 2 (§Coordination). Reversible via
+        // persist.atmosphere.video.mpv_self_place_on_tv.
+        if (maybeSelfPlaceOnSecondaryDisplay()) {
+            relaunchingToSecondary = true
+            finish()
+            return
+        }
 
         // Do these here and not in MainActivity because mpv can be launched from a file browser
         Utils.copyAssets(this)
@@ -377,6 +403,19 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
      * instead. Can be opted out with `setprop mpv.atmosphere.dual_display false`.
      */
     private fun maybeSetupSecondaryDisplay() {
+        // ATM-961: the two TV-routing mechanisms are MUTUALLY EXCLUSIVE. When self-place
+        // is OPTED IN (persist.atmosphere.video.mpv_self_place_on_tv=1), the app's OWN
+        // .MPVActivity window fills display 2 natively — do NOT ALSO bind libmpv to a
+        // VideoSecondaryPresentation on display 2 (that would create a SECOND competing
+        // surface on the same sink = a two-surface fight, §11.4.1). By DEFAULT (0.1.11
+        // mirror-interim: flag default FALSE, self-place crashed on secondary-surface
+        // init and is deferred to ATM-978), self-place is OFF, so this legacy
+        // VideoSecondaryPresentation route is the DEFAULT TV path, behind its own
+        // mpv.atmosphere.dual_display opt-out.
+        if (spBool("persist.atmosphere.video.mpv_self_place_on_tv", false)) {
+            Log.i(TAG, "ATMOSphere ATM-961: self-place owns TV routing — skipping legacy VideoSecondaryPresentation route")
+            return
+        }
         val disabled = try {
             val propClass = Class.forName("android.os.SystemProperties")
             val getMethod = propClass.getMethod(
@@ -456,6 +495,93 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
+    /**
+     * ATMOSphere ATM-961: self-place this MPVActivity (the VIDEO activity, carrying
+     * the VIEW URI) onto the secondary (TV) display so its own landscape window +
+     * SurfaceView + HW decoder fill the TV natively — the device-proven Case-4 fill
+     * path (`am start --display 2 <VIEW mkv> .MPVActivity` composites 0,0,1920,1080
+     * HW). Returns TRUE iff it dispatched a relaunch onto the secondary display and
+     * the caller MUST finish() this primary instance. Guards (ALL must hold): the
+     * master flag is enabled; this instance is NOT already the self-placed one
+     * (intent-extra loop guard); the intent is a VIEW with a data URI (only the real
+     * playback path, never a bare / launcher start); this instance is on the DEFAULT
+     * (primary) display; the Presenter does NOT already OWN this package's relaunch
+     * (persist.atmosphere.video.relaunch_owns stand-down — the §Coordination
+     * interlock); and a PRESENTATION (secondary) display exists. Any failure / throw
+     * → return FALSE → this instance stays on the primary (the Presenter's whole-
+     * primary mirror is the degraded-not-blank fallback).
+     */
+    private fun maybeSelfPlaceOnSecondaryDisplay(): Boolean {
+        // Reversible master flag (§11.4.101 / §11.4.122 / §11.4.124). Default FALSE
+        // (0.1.11 mirror-interim, ATM-961): the self-place-on-display-2 native-fill path
+        // hit a secondary-surface "libmpv is not initialized" crash and is DEFERRED with
+        // the ATM-978 route-native-fill work. MPV now uses the WORKING legacy
+        // VideoSecondaryPresentation route by default (video on display 2 @1920x1080,
+        // controls on primary) — CONSISTENT with the sibling Presenter
+        // persist.atmosphere.video.relaunch_on_tv / .relaunch_secure_on_tv (also OFF).
+        // `setprop persist.atmosphere.video.mpv_self_place_on_tv 1` opts back into self-place.
+        if (!spBool("persist.atmosphere.video.mpv_self_place_on_tv", false)) return false
+        // Loop guard: the relaunched instance carries this extra — never re-place.
+        if (intent?.getBooleanExtra(EXTRA_ON_SECONDARY, false) == true) return false
+        // Only self-place a VIEW-with-URI instance (the actual video). A bare /
+        // launcher start (no data) is not a playback and must stay put.
+        val i = intent
+        if (i == null || i.action != Intent.ACTION_VIEW || i.data == null) return false
+        // Only from the DEFAULT (primary) display. (The relaunched d2 instance also
+        // carries the extra above — this is the second, redundant guard.)
+        val here = try { display?.displayId ?: Display.DEFAULT_DISPLAY } catch (t: Throwable) { Display.DEFAULT_DISPLAY }
+        if (here != Display.DEFAULT_DISPLAY) return false
+        // §Coordination interlock (§11.4.1): if the Presenter OWNS this package's
+        // relaunch, stand down (exactly ONE entity places the app on display 2). The
+        // Presenter NEVER publishes relaunch_owns for a self-render player, so for MPV
+        // this is never set — the fork always self-places; the check is the defensive
+        // mutual-exclusion guarantee against a future / misconfig double-place.
+        if (spString(RELAUNCH_OWNS_PROP, "") == packageName) {
+            Log.i(TAG, "ATMOSphere ATM-961: Presenter owns relaunch of $packageName (relaunch_owns) — standing down, not self-placing")
+            return false
+        }
+        val dm = getSystemService(Context.DISPLAY_SERVICE)
+            as? android.hardware.display.DisplayManager ?: return false
+        val target = dm.getDisplays(
+            android.hardware.display.DisplayManager.DISPLAY_CATEGORY_PRESENTATION,
+        ).firstOrNull() ?: return false
+        return try {
+            // Re-issue THIS activity's own VIEW intent (carrying the video URI +
+            // extras) onto the secondary display, pinned to .MPVActivity so the VIDEO
+            // activity (never the launcher) lands on display 2. FLAG_ACTIVITY_NEW_TASK
+            // is required for a cross-display launch; the extra loop-guards the
+            // relaunched instance.
+            val relaunch = Intent(Intent.ACTION_VIEW).apply {
+                setClass(this@MPVActivity, MPVActivity::class.java)
+                setDataAndType(i.data, i.type)
+                i.extras?.let { putExtras(it) }
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                putExtra(EXTRA_ON_SECONDARY, true)
+            }
+            val opts = ActivityOptions.makeBasic().setLaunchDisplayId(target.displayId)
+            startActivity(relaunch, opts.toBundle())
+            Log.i(TAG, "ATMOSphere ATM-961: self-placed .MPVActivity on display ${target.displayId} (${target.name}) for native landscape fill")
+            true
+        } catch (e: Throwable) {
+            Log.w(TAG, "ATMOSphere ATM-961: self-place on display ${target.displayId} failed: ${e.message} — staying on primary (mirror fallback)")
+            false
+        }
+    }
+
+    /** ATM-961: read a boolean system property via reflection (default on throw). */
+    private fun spBool(name: String, def: Boolean): Boolean = try {
+        val cls = Class.forName("android.os.SystemProperties")
+        cls.getMethod("getBoolean", String::class.java, Boolean::class.javaPrimitiveType)
+            .invoke(null, name, def) as Boolean
+    } catch (t: Throwable) { def }
+
+    /** ATM-961: read a string system property via reflection (default on throw). */
+    private fun spString(name: String, def: String): String = try {
+        val cls = Class.forName("android.os.SystemProperties")
+        cls.getMethod("get", String::class.java, String::class.java)
+            .invoke(null, name, def) as String
+    } catch (t: Throwable) { def }
+
     private fun finishWithResult(code: Int, includeTimePos: Boolean = false) {
         // Refer to http://mpv-android.github.io/mpv-android/intent.html
         // FIXME: should track end-file events to accurately report OK vs CANCELED
@@ -472,6 +598,15 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     }
 
     override fun onDestroy() {
+        // ATM-961: the self-place primary instance finished BEFORE any player / view
+        // init — there is nothing to tear down, and touching binding / player /
+        // mediaSession here would throw on the uninitialized lateinit / fields
+        // (§11.4.1 not-error-prone). The self-placed instance on display 2 runs the
+        // full teardown below normally.
+        if (relaunchingToSecondary) {
+            super.onDestroy()
+            return
+        }
         Log.v(TAG, "Exiting.")
 
         // ATMOSphere dual-display: tear down the Presentation + detach the surface
@@ -2253,6 +2388,14 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     companion object {
         private const val TAG = "mpv"
+
+        // ATM-961: intent-extra loop guard set on the instance self-placed onto the
+        // secondary (TV) display so it never re-places itself.
+        private const val EXTRA_ON_SECONDARY = "atmosphere_on_secondary"
+        // ATM-961: the Presenter publishes this per-package property when IT owns the
+        // relaunch (never for a self-render player). The fork stands down (does not
+        // self-place) when it equals this package (§Coordination mutual exclusion).
+        private const val RELAUNCH_OWNS_PROP = "persist.atmosphere.video.relaunch_owns"
         // how long should controls be displayed on screen (ms)
         private const val CONTROLS_DISPLAY_TIMEOUT = 1500L
         // how long controls fade to disappear (ms)

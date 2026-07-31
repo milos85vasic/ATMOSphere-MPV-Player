@@ -23,20 +23,30 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         MPVLib.setOptionString("profile", "fast")
 
         // vo
-        // ATMOSphere Issue C (2026-06-02) — default to vo=gpu-next (libplacebo).
-        // The deployed libmpv ships libplacebo (pl_renderer_create present) and
-        // gpu-next is the VO the drm_prime dmabuf-EGL hwdec interop targets for
-        // zero-copy 10-bit/HDR import on Mali-G610. Measured on D4
-        // (qa-results/issue_c_mpv_4k_20260602T000000Z/fix/c1_gpunext_rkmpp): with
-        // vo=gpu-next the rkmpp drm_prime frame still cannot import ONLY because
-        // libmpv was built with no drm_prime interop hwdec (buildscripts/scripts/
-        // mpv.sh passes no interop meson flags; only hwdec_aimagereader compiled).
-        // Once that REQUIRES_REBUILD interop fix lands (libdrm into dep_mpv +
-        // mpv meson drm/dmabuf-egl interop), gpu-next delivers HW-decoded smooth
-        // 4K HEVC10. Defaulting here so the win is in effect the moment the
-        // interop driver is present. SharedPref gpu_next still forces the choice
-        // for operators; absence now defaults to gpu-next instead of vanilla gpu.
-        setVo(if (sharedPreferences.getBoolean("gpu_next", true))
+        // ATM-972 part B (2026-07-29) — default to classic vo=gpu, NOT gpu-next.
+        // PROVEN root cause (qa-results/mpv_4k_drmprime_20260729/REPORT.md): on
+        // Android ONLY dmabuf_interop_gl.c is compiled into libmpv (its sibling
+        // dmabuf_interop_pl.c, the gpu-next/ra_pl-compatible interop, is gated
+        // behind features['vaapi'] upstream, which is Linux-desktop-only and
+        // structurally absent here). dmabuf_interop_gl_init() opens with
+        // `if (!ra_is_gl(hw->ra_ctx->ra)) return false;` — true ONLY for a
+        // genuine ra_gl (classic vo=gpu). vo=gpu-next creates a ra_pl, so
+        // ra_is_gl() is structurally false and the interop is refused every
+        // time, tearing down drm_prime and falling through HWDECS to
+        // rkmpp-copy (CPU copy-back + re-upload — the non-zero-copy path that
+        // bottlenecks on 4K where 1080p, with 4x fewer pixels, stays in
+        // budget). The 2026-06-02 comment this replaces asserted gpu-next was
+        // the interop target once the native interop code landed — that
+        // assertion was factually wrong: the native code (already compiled
+        // in, confirmed via `strings libmpv.so` for
+        // "Using EGL dmabuf interop via %s") targets classic gpu, never
+        // gpu-next, on this platform. Defaulting to classic gpu is therefore
+        // the fix, not an interim step. SharedPref gpu_next still lets an
+        // operator force gpu-next (losing zero-copy on 4K, keeping its
+        // modern color-management/dithering/tone-mapping pipeline); absence
+        // now defaults to classic gpu so zero-copy drm_prime engages
+        // out of the box.
+        setVo(if (sharedPreferences.getBoolean("gpu_next", false))
             "gpu-next"
         else
             "gpu")
