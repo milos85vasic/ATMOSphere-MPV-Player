@@ -371,12 +371,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         // so the framework MediaCodec hook doesn't fire. This broadcast tells
         // Presenter to show the video overlay and track playback state.
         try {
-            val presenterIntent = android.content.Intent("com.atmosphere.presenter.MEDIA_STATE_CHANGED")
-            presenterIntent.setPackage("com.atmosphere.presenter")
-            presenterIntent.putExtra("package", packageName)
-            presenterIntent.putExtra("state", "VIDEO_START")
-            presenterIntent.putExtra("title", filepath.substringAfterLast('/'))
-            sendBroadcast(presenterIntent)
+            sendPresenterMediaState("VIDEO_START", filepath.substringAfterLast('/'))
         } catch (e: Exception) {
             Log.d(TAG, "ATMOSphere: Failed to notify Presenter: ${e.message}")
         }
@@ -703,16 +698,32 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // ATMOSphere: Notify Presenter that video playback has stopped.
         try {
-            val presenterIntent = android.content.Intent("com.atmosphere.presenter.MEDIA_STATE_CHANGED")
-            presenterIntent.setPackage("com.atmosphere.presenter")
-            presenterIntent.putExtra("package", packageName)
-            presenterIntent.putExtra("state", "VIDEO_STOP")
-            sendBroadcast(presenterIntent)
+            sendPresenterMediaState("VIDEO_STOP", null)
         } catch (e: Exception) {
             Log.d(TAG, "ATMOSphere: Failed to notify Presenter stop: ${e.message}")
         }
 
         onPauseImpl()
+    }
+
+    /**
+     * ATMOSphere (ATM-1078 / AUTH-02b option A): send the MEDIA_STATE_CHANGED broadcast to Presenter with this
+     * app's identity SHARED, so Presenter can check the claimed "package" extra against the real calling uid
+     * (BroadcastReceiver.getSentFromUid(), API 34). A plain sendBroadcast() leaves Presenter with INVALID_UID:
+     * the claim is then admitted unverified (lenient mode) or dropped (strict mode). API < 34 has no such option.
+     */
+    private fun sendPresenterMediaState(state: String, title: String?) {
+        val presenterIntent = android.content.Intent("com.atmosphere.presenter.MEDIA_STATE_CHANGED")
+        presenterIntent.setPackage("com.atmosphere.presenter")
+        presenterIntent.putExtra("package", packageName)
+        presenterIntent.putExtra("state", state)
+        if (title != null) presenterIntent.putExtra("title", title)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val options = android.app.BroadcastOptions.makeBasic().setShareIdentityEnabled(true).toBundle()
+            sendBroadcast(presenterIntent, null, options)
+        } else {
+            sendBroadcast(presenterIntent)
+        }
     }
 
     private fun tryStartForegroundService(intent: Intent): Boolean {
